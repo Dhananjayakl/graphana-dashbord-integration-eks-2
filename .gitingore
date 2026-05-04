@@ -1,0 +1,40 @@
+# ── Terraform State ────────────────────────────────────────────────────────
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# ── Terraform Plan Files ───────────────────────────────────────────────────
+tfplan*
+*.tfplan
+
+# ── Sensitive Variable Files ───────────────────────────────────────────────
+# Never commit secrets — use TF_VAR_ env vars or GitHub Secrets instead
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ── SSH Keys ───────────────────────────────────────────────────────────────
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# ── OS & Editor Junk ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Logs & Crash Files ─────────────────────────────────────────────────────
+crash.log
+crash.*.log
+*.log
+
+create-s3+dynamoDB.terraform
+create-s3+dynamoDB\.terraform.lock.hcl

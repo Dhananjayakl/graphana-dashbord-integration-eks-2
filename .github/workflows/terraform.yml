@@ -1,0 +1,233 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+env:
+  TF_VERSION: "1.6.0"
+  AWS_REGION: "us-east-1"
+
+concurrency:
+  group: terraform-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 1: Push to dev → deploy DEV, then save prometheus endpoint to SSM
+  # ───────────────────────────────────────────────────────────────────────
+  deploy-dev:
+    name: "Deploy → DEV"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    environment: dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.EC2_PRIVATE_KEY }}" > linux.pem
+          chmod 600 linux.pem
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=dev/terraform.tfstate"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ── Import existing Grafana resources so apply never hits 409 ──────
+      # Fails silently if resource doesn't exist yet or is already in state
+      - name: Import Grafana dev resources (idempotent)
+        run: |
+          terraform import \
+            -var-file="environments/dev.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            'module.grafana.grafana_data_source.prometheus_dev' \
+            '1:prometheus-dev' 2>/dev/null \
+            && echo "✅ Imported prometheus_dev datasource" \
+            || echo "⏭️  Skipped (already in state or not yet created)"
+
+          terraform import \
+            -var-file="environments/dev.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            'module.grafana.grafana_folder.dev' \
+            '1:dev-kubernetes' 2>/dev/null \
+            && echo "✅ Imported dev folder" \
+            || echo "⏭️  Skipped (already in state or not yet created)"
+        env:
+          TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var-file="environments/dev.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            -out=tfplan-dev
+        env:
+          TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan-dev
+        env:
+          TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f linux.pem
+
+      # After dev deploys, capture the prometheus endpoint and store in SSM
+      # so the prod pipeline can read it automatically — no manual step needed
+      - name: Save dev Prometheus endpoint to SSM
+        run: |
+          DEV_ENDPOINT=$(terraform output -raw prometheus_endpoint)
+          echo "Dev Prometheus endpoint: $DEV_ENDPOINT"
+          aws ssm put-parameter \
+            --name "/terraform/dev/prometheus_endpoint" \
+            --value "$DEV_ENDPOINT" \
+            --type "String" \
+            --overwrite
+          echo "✅ Saved to SSM: /terraform/dev/prometheus_endpoint"
+
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 2: Merge dev→main → read SSM, deploy PROD with both endpoints
+  # ───────────────────────────────────────────────────────────────────────
+  deploy-prod:
+    name: "Deploy → PROD"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'dev'
+    environment: prod
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.EC2_PRIVATE_KEY }}" > linux.pem
+          chmod 600 linux.pem
+
+      # Read the dev prometheus endpoint saved by the dev pipeline
+      # FIX: write to $GITHUB_ENV so subsequent steps can use it correctly
+      - name: Read dev Prometheus endpoint from SSM
+        id: ssm
+        run: |
+          DEV_ENDPOINT=$(aws ssm get-parameter \
+            --name "/terraform/dev/prometheus_endpoint" \
+            --query "Parameter.Value" \
+            --output text)
+          echo "dev_endpoint=$DEV_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "✅ Retrieved from SSM: $DEV_ENDPOINT"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=prod/terraform.tfstate"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ── Import existing Grafana resources so apply never hits 409 ──────
+      # Imports both dev resources (shared Grafana) and prod resources
+      # All fail silently if already in state or not yet created
+      - name: Import Grafana resources (idempotent)
+        run: |
+          # Dev datasource & folder (shared Grafana instance)
+          terraform import \
+            -var-file="environments/prod.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            -var="prometheus_dev_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            -var="prometheus_prod_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            'module.grafana.grafana_data_source.prometheus_dev' \
+            '1:prometheus-dev' 2>/dev/null \
+            && echo "✅ Imported prometheus_dev datasource" \
+            || echo "⏭️  Skipped"
+
+          terraform import \
+            -var-file="environments/prod.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            -var="prometheus_dev_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            -var="prometheus_prod_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            'module.grafana.grafana_folder.dev' \
+            '1:dev-kubernetes' 2>/dev/null \
+            && echo "✅ Imported dev folder" \
+            || echo "⏭️  Skipped"
+
+          # Prod datasource & folder
+          terraform import \
+            -var-file="environments/prod.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            -var="prometheus_dev_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            -var="prometheus_prod_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            'module.grafana.grafana_data_source.prometheus_prod[0]' \
+            '1:prometheus-prod' 2>/dev/null \
+            && echo "✅ Imported prometheus_prod datasource" \
+            || echo "⏭️  Skipped"
+
+          terraform import \
+            -var-file="environments/prod.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            -var="prometheus_dev_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            -var="prometheus_prod_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            'module.grafana.grafana_folder.prod[0]' \
+            '1:prod-kubernetes' 2>/dev/null \
+            && echo "✅ Imported prod folder" \
+            || echo "⏭️  Skipped"
+        env:
+          TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var-file="environments/prod.tfvars" \
+            -var="ec2_private_key_path=linux.pem" \
+            -var="prometheus_dev_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            -var="prometheus_prod_endpoint=${{ steps.ssm.outputs.dev_endpoint }}" \
+            -out=tfplan-prod
+        env:
+          TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan-prod
+        env:
+          TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f linux.pem
