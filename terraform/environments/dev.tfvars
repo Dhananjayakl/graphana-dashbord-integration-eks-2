@@ -1,5 +1,5 @@
 # ── dev.tfvars ─────────────────────────────────────────────────────────────
-# Use with: terraform apply -var-file=environments/dev.tfvars
+# Use with: terraform apply -var-file=environments/dev.tfvarss
 
 aws_region       = "us-east-1"
 environment      = "dev"
